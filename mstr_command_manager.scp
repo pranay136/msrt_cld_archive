@@ -1,0 +1,251 @@
+/*
+================================================================================
+  MicroStrategy Command Manager Harvester Scripts
+  ================================================
+  Use these scripts with MicroStrategy Command Manager (mstrcmd) for server-side
+  discovery and operations that complement the REST API harvester.
+
+  USAGE:
+    mstrcmd -f mstr_command_manager.scp -o output.txt
+       OR
+    %MSTR_INSTALL%\bin\mstrcmd.exe -f mstr_command_manager.scp -n "MSTR_SERVER"
+        -u Administrator -p YourPassword -D MetadataDB
+
+  AUTHOR: MicroStrategy Admin Automation Toolkit
+  VERSION: 2.0
+================================================================================
+*/
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 1 — CONNECT TO INTELLIGENCE SERVER
+  ─────────────────────────────────────────────────────────────────────────────
+  Replace values in <angle brackets> with your actual server details.
+*/
+
+CONNECT SERVER "<YOUR_IS_HOSTNAME>" PROJECT "<YOUR_PROJECT_NAME>"
+  USERNAME "<Administrator>"
+  PASSWORD "<YourPassword>";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 2 — LIST ALL PROJECTS
+  Outputs project name, status, and description
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL PROJECTS;
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 3 — LIST ALL USERS (full detail)
+  Outputs username, full name, login type, enabled status, description
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL USERS;
+
+/* Detailed user privileges — run for each user or use wildcard */
+LIST ALL PRIVILEGES FOR USER "*";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 4 — LIST ALL USER GROUPS
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL USERGROUPS;
+
+/* Membership detail for each group */
+LIST ALL MEMBERS FOR USERGROUP "*";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 5 — LIST ALL SECURITY ROLES
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL SECURITY ROLES;
+LIST ALL PRIVILEGES FOR SECURITY ROLE "*";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 6 — LIST ALL DATABASE CONNECTIONS
+  Outputs DSN names, DB types, login info
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL DBCONNECTIONS;
+LIST ALL DBROLES;
+LIST ALL DBLOGINS;
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 7 — LIST ALL SCHEDULES AND SUBSCRIPTIONS
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL SCHEDULES;
+LIST ALL SUBSCRIPTIONS;
+
+/* Detail per schedule */
+LIST ALL SUBSCRIPTIONS FOR SCHEDULE "*";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 8 — LIST OBJECTS BY TYPE (Run per project)
+  Object types:
+    REPORT       = standard reports
+    DOCUMENT     = documents / dossiers
+    METRIC       = metrics
+    ATTRIBUTE    = attributes
+    FACT         = facts
+    FILTER       = filters
+    PROMPT       = prompts
+    CONSOLIDATION= consolidations
+    CUSTOMGROUP  = custom groups
+    HIERARCHY    = hierarchies
+    TRANSFORMATION = transformations
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/* --- REPORTS --- */
+LIST ALL REPORTS;
+
+/* --- DOCUMENTS & DOSSIERS --- */
+LIST ALL DOCUMENTS;
+
+/* --- METRICS --- */
+LIST ALL METRICS;
+
+/* --- ATTRIBUTES --- */
+LIST ALL ATTRIBUTES;
+
+/* --- FACTS --- */
+LIST ALL FACTS;
+
+/* --- FILTERS --- */
+LIST ALL FILTERS;
+
+/* --- PROMPTS --- */
+LIST ALL PROMPTS;
+
+/* --- CONSOLIDATIONS --- */
+LIST ALL CONSOLIDATIONS;
+
+/* --- CUSTOM GROUPS --- */
+LIST ALL CUSTOMGROUPS;
+
+/* --- HIERARCHIES --- */
+LIST ALL HIERARCHIES;
+
+/* --- TRANSFORMATIONS --- */
+LIST ALL TRANSFORMATIONS;
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 9 — SERVER CONFIGURATION DETAILS
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/* Intelligence Server configuration */
+LIST ALL PROPERTIES FOR SERVER "<YOUR_IS_HOSTNAME>";
+
+/* Project-level properties */
+LIST ALL PROPERTIES FOR PROJECT "<YOUR_PROJECT_NAME>";
+
+/* VLDB properties */
+LIST VLDB SETTINGS FOR PROJECT "<YOUR_PROJECT_NAME>";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 10 — CACHE MANAGEMENT (Discovery)
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/* List report caches */
+LIST ALL REPORT CACHES FOR PROJECT "<YOUR_PROJECT_NAME>";
+
+/* List element caches */
+LIST ALL ELEMENT CACHES FOR PROJECT "<YOUR_PROJECT_NAME>";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 11 — SECURITY FILTERS (per project)
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL SECURITY FILTERS;
+LIST ALL SECURITY FILTERS FOR USER "*";
+LIST ALL SECURITY FILTERS FOR USERGROUP "*";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 12 — EXPORT PROJECT PACKAGE (for migration)
+  Use Object Manager or this Command Manager script to export for lift-and-shift
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/*
+EXPORT OBJECT_PACKAGE "<OUTPUT_PATH>\project_package.mmp"
+  FOR PROJECT "<YOUR_PROJECT_NAME>"
+  INCLUDING DEPENDENTS YES
+  INCLUDING ACCESS CONTROL YES
+  OVERWRITE YES;
+*/
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 13 — IMPORT PROJECT PACKAGE (on cloud IS — run after migration)
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/*
+IMPORT OBJECT_PACKAGE "<OUTPUT_PATH>\project_package.mmp"
+  INTO PROJECT "<YOUR_PROJECT_NAME>"
+  OVERWRITE YES
+  KEEP NEWER YES;
+*/
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 14 — OPERATIONAL COMMANDS (post-migration)
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/* Reload a project on cloud IS after import */
+/* LOAD PROJECT "<YOUR_PROJECT_NAME>"; */
+
+/* Purge report caches on cloud (fresh start) */
+/* PURGE ALL REPORT CACHES FOR PROJECT "<YOUR_PROJECT_NAME>"; */
+
+/* Pre-warm caches for top reports */
+/* EXECUTE REPORT "<REPORT_NAME>" IN PROJECT "<YOUR_PROJECT_NAME>"; */
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 15 — VALIDATION QUERIES (run on cloud after migration)
+  Compare output against on-prem baseline from Section 2–11
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+LIST ALL PROJECTS;
+LIST ALL USERS;
+LIST ALL USERGROUPS;
+LIST ALL SCHEDULES;
+LIST ALL SUBSCRIPTIONS;
+LIST ALL DBCONNECTIONS;
+LIST ALL REPORTS;
+LIST ALL DOCUMENTS;
+LIST ALL METRICS;
+LIST ALL ATTRIBUTES;
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  SECTION 16 — DISCONNECT
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+DISCONNECT SERVER "<YOUR_IS_HOSTNAME>";
+
+/* END OF SCRIPT */
