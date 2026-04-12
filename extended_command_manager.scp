@@ -1,0 +1,589 @@
+/*
+================================================================================
+  MicroStrategy Extended Command Manager Scripts v2.0
+  =====================================================
+  Advanced bulk operations for MicroStrategy migration and administration.
+  These scripts complement mstr_command_manager.scp with:
+
+    ► Bulk VLDB property changes (project-level and object-level)
+    ► Bulk schedule creation and updates
+    ► Bulk user creation from a defined list
+    ► Bulk security filter assignment to users and groups
+    ► Cache management and project lifecycle controls
+    ► Subscription and delivery bulk operations
+    ► Post-migration hardening and cleanup
+
+  EXECUTION METHOD — Command Manager (MSTR native layer):
+  ========================================================
+  Command Manager runs as a REMOTE CLIENT connecting to the IS over the
+  standard IS port (34952). It does NOT need to run on the IS host itself.
+
+  Windows:
+    %MSTR_HOME%\bin\mstrcmd.exe -f extended_command_manager.scp ^
+        -n IS_HOSTNAME -u Administrator -p YourPassword ^
+        -o extended_cm_output.txt
+
+  Linux:
+    $MSTR_HOME/bin/mstrcmd -f extended_command_manager.scp \
+        -n IS_HOSTNAME -u Administrator -p YourPassword \
+        -o extended_cm_output.txt
+
+  Selective execution:
+    Run only specific sections by commenting out the rest with /* ... */ markers.
+
+  OUTPUT: All LIST commands write to the -o file. All ALTER/CREATE/ASSIGN
+          commands write status lines (success/error) to the -o file.
+
+  REQUIREMENTS: mstrcmd binary from MSTR installation (any version matching IS).
+                Admin credentials on the target IS.
+
+  AUTHOR: MicroStrategy Admin Automation Toolkit | VERSION: 2.0
+================================================================================
+*/
+
+
+/* ============================================================================
+   SECTION 0 — AUTHENTICATE
+   Connect once; all subsequent commands reuse this session.
+   ============================================================================ */
+
+/* ── Replace these values before running ─────────────────────────────────── */
+#DEFINE IS_HOST       "YOUR-MSTR-HOST"
+#DEFINE IS_PORT       "34952"
+#DEFINE ADMIN_USER    "Administrator"
+#DEFINE ADMIN_PASS    "YOUR_ADMIN_PASSWORD"
+#DEFINE PROJECT_NAME  "YOUR_PROJECT_NAME"
+
+LOGIN SERVER "#IS_HOST" PROJECT "#PROJECT_NAME"
+    LOGIN "#ADMIN_USER" PASSWORD "#ADMIN_PASS"
+    PORT #IS_PORT;
+
+
+/* ============================================================================
+   SECTION 1 — BULK VLDB PROPERTY CHANGES (PROJECT-LEVEL)
+   Applies VLDB settings to every object in a project at once.
+   Much faster than changing properties object-by-object in the GUI.
+
+   Common use cases during cloud migration:
+     • Switch from SQL_PASS_THROUGH to ANSI-92 joins after DB upgrade
+     • Enable metric join type changes after cloud DB dialect change
+     • Update max rows / max SQL passes for cloud IS resource limits
+     • Force intermediate table type for cloud-compatible temp tables
+   ============================================================================ */
+
+/* ── 1A. List current project-level VLDB settings (audit before changing) ── */
+LIST ALL VLDB PROPERTIES FOR PROJECT "#PROJECT_NAME";
+
+/* ── 1B. Common cloud-migration VLDB adjustments ────────────────────────── */
+
+/* Limit result rows for cloud resource governance (prevent runaway queries) */
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Maximum Rows Returned to Analytical Engine" VALUE "2000000";
+
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Maximum SQL Passes" VALUE "50";
+
+/* Disable cross-join warnings if cloud DW is wide-schema */
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Disable Cross Join Warning" VALUE "1";
+
+/* Use ANSI-92 outer join syntax (required for most cloud ANSI SQL DBs) */
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Join Type" VALUE "1";    /* 0=ANSI-89, 1=ANSI-92 */
+
+/* Use global temp tables (##) instead of local (#) for cloud SQL Server */
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Intermediate Table Type" VALUE "2";  /* 2=Permanent, 1=Temp */
+
+/* Turn off metric subtotals at report level to reduce cloud query overhead */
+ALTER PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Use Subtotals" VALUE "0";
+
+/* ── 1C. Verify changes applied ─────────────────────────────────────────── */
+LIST ALL VLDB PROPERTIES FOR PROJECT "#PROJECT_NAME";
+
+
+/* ============================================================================
+   SECTION 2 — BULK VLDB PROPERTY CHANGES (OBJECT-LEVEL)
+   Target specific reports or metrics that need individual tuning.
+   Use this after Section 1 for exception cases.
+   ============================================================================ */
+
+/* ── 2A. List VLDB properties for a specific report ─────────────────────── */
+LIST VLDB PROPERTIES FOR REPORT "Your Report Name"
+    IN FOLDER "Public Objects\Reports\Shared Reports"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 2B. Override VLDB for a high-volume report (e.g., raise row limit) ─── */
+ALTER REPORT "Your High Volume Report Name"
+    IN FOLDER "Public Objects\Reports\Shared Reports"
+    ON PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "Maximum Rows Returned to Analytical Engine" VALUE "5000000";
+
+/* ── 2C. Force a specific report to use pre-computed OLAP functions ──────── */
+ALTER REPORT "Your OLAP Report Name"
+    IN FOLDER "Public Objects\Reports\Analytics"
+    ON PROJECT "#PROJECT_NAME"
+    VLDB PROPERTY "OLAP Functions" VALUE "1";
+
+/* ── 2D. Bulk-target a folder: apply consistent VLDB to a report folder ─── */
+/* Note: Command Manager does not support folder-level looping natively.
+   Repeat the ALTER REPORT block for each report in the folder, or generate
+   these lines programmatically from 09_reports.csv using Python:
+
+   python -c "
+   import csv
+   with open('discovery_output/09_reports.csv') as f:
+       for row in csv.DictReader(f):
+           if 'Shared Reports' in row.get('path',''):
+               print(f\"ALTER REPORT \\\"{row['name']}\\\" \")
+               print(f\"    IN FOLDER \\\"{row['path']}\\\" \")
+               print(f\"    ON PROJECT \\\"#PROJECT_NAME\\\" \")
+               print(f\"    VLDB PROPERTY \\\"Maximum Rows Returned to Analytical Engine\\\" VALUE \\\"2000000\\\";\")
+   " >> vldb_bulk.scp
+*/
+
+
+/* ============================================================================
+   SECTION 3 — BULK SCHEDULE CREATION
+   Re-create all schedules from on-prem on the cloud IS.
+   Typically used after package migration when schedules are absent.
+
+   Schedule types:
+     TIME_BASED  — runs at a fixed time/interval
+     EVENT_BASED — triggers on a named event
+
+   Frequency values (TIME_BASED):
+     DAILY, WEEKLY, MONTHLY, ONCE
+   ============================================================================ */
+
+/* ── 3A. List existing schedules first (idempotency check) ──────────────── */
+LIST ALL SCHEDULES;
+
+/* ── 3B. Create a daily schedule (runs every day at 06:00 AM) ───────────── */
+CREATE SCHEDULE "Daily 6AM Run"
+    DESCRIPTION "Automated daily refresh at 6:00 AM"
+    SCHEDULE TYPE "TIME_BASED"
+    START DATE "01/01/2026"
+    START TIME "06:00:00"
+    FREQUENCY DAILY EVERY 1 DAYS
+    ENABLED;
+
+/* ── 3C. Create a weekday-only schedule (Mon-Fri at 07:30 AM) ───────────── */
+CREATE SCHEDULE "Weekday Morning Refresh"
+    DESCRIPTION "Monday through Friday morning data refresh"
+    SCHEDULE TYPE "TIME_BASED"
+    START DATE "01/01/2026"
+    START TIME "07:30:00"
+    FREQUENCY WEEKLY EVERY 1 WEEKS
+    DAYS OF WEEK MON TUE WED THU FRI
+    ENABLED;
+
+/* ── 3D. Create an end-of-month schedule ────────────────────────────────── */
+CREATE SCHEDULE "Monthly End-of-Month"
+    DESCRIPTION "Runs on the last day of each month at 11:00 PM"
+    SCHEDULE TYPE "TIME_BASED"
+    START DATE "01/01/2026"
+    START TIME "23:00:00"
+    FREQUENCY MONTHLY LAST DAY OF MONTH
+    ENABLED;
+
+/* ── 3E. Create an intraday schedule (every 2 hours during business hours) ─ */
+CREATE SCHEDULE "Business Hours Refresh - 2hr"
+    DESCRIPTION "Refresh every 2 hours 8AM-6PM"
+    SCHEDULE TYPE "TIME_BASED"
+    START DATE "01/01/2026"
+    START TIME "08:00:00"
+    STOP TIME  "18:00:00"
+    FREQUENCY DAILY EVERY 2 HOURS
+    DAYS OF WEEK MON TUE WED THU FRI
+    ENABLED;
+
+/* ── 3F. Create an event-based schedule ─────────────────────────────────── */
+CREATE SCHEDULE "Post-ETL Trigger"
+    DESCRIPTION "Fires when ETL_COMPLETE event is raised"
+    SCHEDULE TYPE "EVENT_BASED"
+    EVENT "ETL_COMPLETE"
+    ENABLED;
+
+/* ── 3G. Update an existing schedule (change run time) ──────────────────── */
+ALTER SCHEDULE "Daily 6AM Run"
+    START TIME "05:00:00";
+
+/* ── 3H. Enable / disable schedules in bulk ─────────────────────────────── */
+ALTER SCHEDULE "Daily 6AM Run"           ENABLED;
+ALTER SCHEDULE "Weekday Morning Refresh" ENABLED;
+ALTER SCHEDULE "Monthly End-of-Month"    ENABLED;
+
+/* To disable: replace ENABLED with DISABLED */
+/* ALTER SCHEDULE "Business Hours Refresh - 2hr" DISABLED; */
+
+/* ── 3I. Delete a schedule no longer needed ─────────────────────────────── */
+/* DELETE SCHEDULE "Old Daily Refresh"; */
+
+/* ── 3J. Verify all schedules after creation ────────────────────────────── */
+LIST ALL SCHEDULES;
+
+
+/* ============================================================================
+   SECTION 4 — BULK USER CREATION
+   Create users from a defined list directly in Command Manager.
+   Faster than the GUI for batch provisioning; works on any IS version.
+
+   For large volumes (50+ users), use mstr_user_migrator.py (REST API) instead,
+   which reads directly from the 03_users.csv harvest file.
+
+   Login modes:
+     STANDARD  — local MSTR password auth (loginMode=1)
+     LDAP      — LDAP / Active Directory (loginMode=16)
+     SAML      — SAML 2.0 SSO (loginMode=64)
+   ============================================================================ */
+
+/* ── 4A. List existing users before creating (idempotency check) ─────────── */
+LIST ALL USERS;
+
+/* ── 4B. Create a standard (password) user ──────────────────────────────── */
+CREATE USER "john.smith"
+    FULLNAME "John Smith"
+    PASSWORD "Temp@Passw0rd!"
+    DESCRIPTION "Finance department analyst"
+    EMAIL "john.smith@company.com"
+    LOGIN MODE STANDARD
+    REQUIRENEWPASSWORD TRUE
+    ENABLED;
+
+/* ── 4C. Create an LDAP-auth user (no MSTR password needed) ─────────────── */
+CREATE USER "jane.doe"
+    FULLNAME "Jane Doe"
+    DESCRIPTION "Marketing analyst - LDAP auth"
+    EMAIL "jane.doe@company.com"
+    LOGIN MODE LDAP
+    LDAP LOGIN "CN=jane.doe,OU=Users,DC=company,DC=com"
+    ENABLED;
+
+/* ── 4D. Create a SAML SSO user (shell account — no password) ───────────── */
+CREATE USER "api.svc.account"
+    FULLNAME "API Service Account"
+    DESCRIPTION "Headless service account for API integrations"
+    EMAIL "api-alerts@company.com"
+    LOGIN MODE STANDARD
+    PASSWORD "Svc@Passw0rd#2026!"
+    REQUIRENEWPASSWORD FALSE
+    ENABLED;
+
+/* ── 4E. Bulk user block — repeat this block for each user ──────────────── */
+/*
+   TIP: Generate this block from 03_users.csv with:
+
+   python -c "
+   import csv
+   with open('discovery_output/03_users.csv') as f:
+       for row in csv.DictReader(f):
+           if row.get('login_mode_label','') == 'Standard' and \
+              row.get('username','').lower() not in ('administrator','guest'):
+               u = row['username'].replace('\"','')
+               fn = row.get('full_name','').replace('\"','')
+               em = row.get('email','').replace('\"','')
+               print(f'CREATE USER \"{u}\"')
+               print(f'    FULLNAME \"{fn}\"')
+               print(f'    PASSWORD \"Temp@MigrPwd2026!\"')
+               print(f'    EMAIL \"{em}\"')
+               print(f'    LOGIN MODE STANDARD')
+               print(f'    REQUIRENEWPASSWORD TRUE')
+               print(f'    ENABLED;')
+               print()
+   " >> bulk_users.scp
+*/
+
+/* ── 4F. Add users to groups ────────────────────────────────────────────── */
+ADD USER "john.smith" TO USERGROUP "Finance Users";
+ADD USER "jane.doe"   TO USERGROUP "Marketing Users";
+ADD USER "john.smith" TO USERGROUP "Report Consumers";
+
+/* ── 4G. Remove a user from a group ─────────────────────────────────────── */
+/* REMOVE USER "john.smith" FROM USERGROUP "Old Group"; */
+
+/* ── 4H. Alter user properties (e.g., reset password after migration) ────── */
+ALTER USER "john.smith"
+    DESCRIPTION "Finance analyst — migrated from on-prem";
+
+/* ── 4I. Disable stale user accounts post-migration ─────────────────────── */
+/* ALTER USER "former.employee" DISABLED; */
+
+/* ── 4J. Delete a user (use with caution — removes subscriptions too) ────── */
+/* DELETE USER "temp.migration.user"; */
+
+/* ── 4K. Verify users after creation ────────────────────────────────────── */
+LIST ALL USERS;
+LIST ALL USERGROUPS;
+
+
+/* ============================================================================
+   SECTION 5 — BULK SECURITY FILTER ASSIGNMENT
+   Assign security filters to users and user groups at scale.
+   Critical post-migration step — security filters don't travel in packages
+   in all MSTR versions.
+
+   Security filter assignment controls what DATA rows a user can see.
+   This is different from security roles (which control feature access).
+   ============================================================================ */
+
+/* ── 5A. List all security filters in the project ───────────────────────── */
+LIST ALL SECURITY FILTERS ON PROJECT "#PROJECT_NAME";
+
+/* ── 5B. List security filter assignments for a specific user ───────────── */
+LIST SECURITY FILTER FOR USER "john.smith" ON PROJECT "#PROJECT_NAME";
+
+/* ── 5C. Assign a security filter to a single user ──────────────────────── */
+ASSIGN SECURITY FILTER "North America Filter"
+    TO USER "john.smith"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 5D. Assign a security filter to a user group (affects ALL members) ─── */
+ASSIGN SECURITY FILTER "EMEA Region Filter"
+    TO USERGROUP "EMEA Analysts"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 5E. Assign multiple filters to a user ──────────────────────────────── */
+ASSIGN SECURITY FILTER "Finance Department Filter"
+    TO USER "john.smith"
+    ON PROJECT "#PROJECT_NAME";
+
+ASSIGN SECURITY FILTER "Q1 2026 Data Filter"
+    TO USER "john.smith"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 5F. Remove a security filter from a user ───────────────────────────── */
+/* UNASSIGN SECURITY FILTER "Old Region Filter"
+       FROM USER "john.smith"
+       ON PROJECT "#PROJECT_NAME"; */
+
+/* ── 5G. Bulk assignment — generate from 07_security_filters.csv ─────────
+   The harvest file 07_security_filters.csv contains security filter names.
+   The harvest file 05_group_membership.csv contains user → group mapping.
+   Cross-reference to generate ASSIGN commands:
+
+   python -c "
+   import csv
+   # Map: group_name -> security_filter_name (define your mapping here)
+   GROUP_FILTER_MAP = {
+       'Finance Users':  'Finance Department Filter',
+       'EMEA Analysts':  'EMEA Region Filter',
+       'APAC Analysts':  'APAC Region Filter',
+       'NA Analysts':    'North America Filter',
+   }
+   with open('discovery_output/04_usergroups.csv') as f:
+       for row in csv.DictReader(f):
+           gname = row.get('name','')
+           if gname in GROUP_FILTER_MAP:
+               sf = GROUP_FILTER_MAP[gname]
+               print(f'ASSIGN SECURITY FILTER \"{sf}\"')
+               print(f'    TO USERGROUP \"{gname}\"')
+               print(f'    ON PROJECT \"#PROJECT_NAME\";')
+               print()
+   " >> bulk_security_filters.scp
+*/
+
+/* ── 5H. Verify security filter assignments after bulk assign ────────────── */
+LIST ALL SECURITY FILTERS ON PROJECT "#PROJECT_NAME";
+
+
+/* ============================================================================
+   SECTION 6 — BULK SUBSCRIPTION MANAGEMENT
+   Re-create or modify subscriptions post-migration.
+   Subscriptions often need their recipients updated when email addresses change.
+   ============================================================================ */
+
+/* ── 6A. List all subscriptions in the project ──────────────────────────── */
+LIST ALL SUBSCRIPTIONS ON PROJECT "#PROJECT_NAME";
+
+/* ── 6B. Trigger a subscription manually (useful for smoke testing) ──────── */
+TRIGGER SUBSCRIPTION "Daily Finance Summary"
+    FOR USER "john.smith"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 6C. Enable / disable a subscription ────────────────────────────────── */
+ALTER SUBSCRIPTION "Daily Finance Summary"
+    FOR USER "john.smith"
+    ON PROJECT "#PROJECT_NAME"
+    ENABLED;
+
+/* ALTER SUBSCRIPTION "Old Monthly Report"
+       FOR USER "john.smith"
+       ON PROJECT "#PROJECT_NAME"
+       DISABLED; */
+
+/* ── 6D. Delete a subscription that no longer applies ───────────────────── */
+/* DELETE SUBSCRIPTION "Obsolete Report Sub"
+       FOR USER "former.employee"
+       ON PROJECT "#PROJECT_NAME"; */
+
+
+/* ============================================================================
+   SECTION 7 — CACHE MANAGEMENT
+   Essential post-migration operations. Cloud IS caches are empty after
+   migration — use this section to purge stale on-prem cache data (if any
+   was imported) or to pre-populate caches via schedule triggers.
+
+   For automated cache warming via REST API, use mstr_cache_warmer.py instead.
+   This section covers administrative cache control via Command Manager.
+   ============================================================================ */
+
+/* ── 7A. List cache statistics per project ──────────────────────────────── */
+LIST ALL CACHES ON PROJECT "#PROJECT_NAME";
+
+/* ── 7B. Purge all report caches (clean slate on cloud IS) ──────────────── */
+PURGE CACHE TYPE REPORT
+    FOR PROJECT "#PROJECT_NAME";
+
+/* ── 7C. Purge element caches ───────────────────────────────────────────── */
+PURGE CACHE TYPE ELEMENT
+    FOR PROJECT "#PROJECT_NAME";
+
+/* ── 7D. Purge ALL cache types in one command ───────────────────────────── */
+PURGE CACHE TYPE ALL
+    FOR PROJECT "#PROJECT_NAME";
+
+/* ── 7E. Monitor cache state after purge ────────────────────────────────── */
+LIST ALL CACHES ON PROJECT "#PROJECT_NAME";
+
+
+/* ============================================================================
+   SECTION 8 — PROJECT LIFECYCLE MANAGEMENT
+   Load, unload, and monitor projects. Critical for migration sequencing:
+     1. Unload project on source IS (drain connections)
+     2. Import package to cloud IS
+     3. Load project on cloud IS
+     4. Verify users can connect
+   ============================================================================ */
+
+/* ── 8A. List project status ────────────────────────────────────────────── */
+LIST ALL PROJECTS;
+
+/* ── 8B. Unload a project (disconnect all users before package export) ───── */
+/* UNLOAD PROJECT "#PROJECT_NAME"; */
+
+/* ── 8C. Load a project after import on cloud IS ────────────────────────── */
+LOAD PROJECT "#PROJECT_NAME";
+
+/* ── 8D. Set project-level governor limits (cloud resource management) ───── */
+ALTER PROJECT "#PROJECT_NAME"
+    MAXIMUM JOBS 50;
+
+ALTER PROJECT "#PROJECT_NAME"
+    MAXIMUM CONNECTIONS PER USER 5;
+
+/* ── 8E. Reload the project (for config changes to take effect) ──────────── */
+/* UNLOAD PROJECT "#PROJECT_NAME";
+   LOAD PROJECT "#PROJECT_NAME"; */
+
+
+/* ============================================================================
+   SECTION 9 — BULK OBJECT ADMINISTRATION
+   Manage MicroStrategy objects (reports, documents, metrics) in bulk.
+   ============================================================================ */
+
+/* ── 9A. List all objects in a folder ───────────────────────────────────── */
+LIST ALL OBJECTS IN FOLDER "Public Objects\Reports\Shared Reports"
+    ON PROJECT "#PROJECT_NAME";
+
+/* ── 9B. Change object owner after user migration ────────────────────────── */
+ALTER REPORT "Quarterly Revenue Analysis"
+    IN FOLDER "Public Objects\Reports\Finance"
+    ON PROJECT "#PROJECT_NAME"
+    OWNER "john.smith";
+
+/* ── 9C. Move an object to a different folder ───────────────────────────── */
+/* MOVE REPORT "Old Report Name"
+       FROM FOLDER "Public Objects\Reports\Archive"
+       TO FOLDER "Public Objects\Reports\Finance"
+       ON PROJECT "#PROJECT_NAME"; */
+
+/* ── 9D. List all reports with their schedules ──────────────────────────── */
+LIST ALL REPORTS ON PROJECT "#PROJECT_NAME";
+LIST ALL DOCUMENTS ON PROJECT "#PROJECT_NAME";
+
+/* ── 9E. Bulk change report cache setting ────────────────────────────────── */
+ALTER REPORT "Quarterly Revenue Analysis"
+    IN FOLDER "Public Objects\Reports\Finance"
+    ON PROJECT "#PROJECT_NAME"
+    CACHE SETTING "REFRESH";   /* Options: REFRESH, CACHE_THEN_REFRESH, NEVER */
+
+
+/* ============================================================================
+   SECTION 10 — DB CONNECTION MANAGEMENT
+   Verify and update database connections post-migration.
+   Particularly useful when the cloud DW uses different credentials or host.
+   For full DB connection creation, use mstr_db_connection_creator.py instead.
+   ============================================================================ */
+
+/* ── 10A. List all database connections ─────────────────────────────────── */
+LIST ALL DBCONNECTIONS;
+
+/* ── 10B. List all database instances (datasource definitions) ───────────── */
+LIST ALL DBINSTANCES;
+
+/* ── 10C. Update a DB connection host (e.g., cloud DW endpoint changed) ─── */
+ALTER DBCONNECTION "On-Prem Warehouse Conn"
+    DBMS "Microsoft SQL Server 2019"
+    HOST "cloud-dw.company.com"
+    PORT 1433
+    DATABASE "WarehouseDB";
+
+/* ── 10D. Update DB connection credentials ───────────────────────────────── */
+ALTER DBCONNECTION "On-Prem Warehouse Conn"
+    LOGIN "svc_mstr_cloud"
+    PASSWORD "CloudDwPass2026!";
+
+/* ── 10E. Verify DB connections after update ────────────────────────────── */
+LIST ALL DBCONNECTIONS;
+
+
+/* ============================================================================
+   SECTION 11 — LDAP / SAML CONFIGURATION AUDIT
+   Verify authentication configuration carried over from on-prem.
+   Typically you must re-enter LDAP/SAML settings manually on cloud IS
+   (they are not part of the project package).
+   ============================================================================ */
+
+/* ── 11A. List LDAP configuration ───────────────────────────────────────── */
+LIST ALL LDAP SERVERS;
+
+/* ── 11B. List current server configuration ─────────────────────────────── */
+LIST ALL CONFIGURATIONS;
+
+/* ── 11C. List all server events (useful for event-based schedule audit) ─── */
+LIST ALL EVENTS;
+
+
+/* ============================================================================
+   SECTION 12 — FULL POST-MIGRATION VALIDATION CHECKLIST
+   Run all these LIST commands on the cloud IS to compare with on-prem baseline.
+   Pipe the -o output to a text file and diff with on-prem harvest output.
+   ============================================================================ */
+
+LIST ALL PROJECTS;
+LIST ALL USERS;
+LIST ALL USERGROUPS;
+LIST ALL SCHEDULES;
+LIST ALL SUBSCRIPTIONS ON PROJECT "#PROJECT_NAME";
+LIST ALL DBCONNECTIONS;
+LIST ALL DBINSTANCES;
+LIST ALL SECURITY FILTERS ON PROJECT "#PROJECT_NAME";
+LIST ALL CACHES ON PROJECT "#PROJECT_NAME";
+LIST ALL EVENTS;
+LIST ALL CONFIGURATIONS;
+LIST ALL REPORTS ON PROJECT "#PROJECT_NAME";
+LIST ALL DOCUMENTS ON PROJECT "#PROJECT_NAME";
+
+
+/* ============================================================================
+   SECTION 13 — CLEANUP AND LOGOUT
+   Always log out cleanly to release IS resources.
+   ============================================================================ */
+
+LOGOUT;
+
+/* ============================================================================
+   END OF SCRIPT
+   ============================================================================ */

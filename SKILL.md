@@ -20,11 +20,18 @@ tags:
   - automation
   - genai
 scripts:
+  # REST API scripts (run from any machine via HTTPS)
   - mstr_harvester.py
   - mstr_validator.py
   - mstr_connectivity_tester.py
+  - mstr_db_connection_creator.py
+  - mstr_package_migrator.py
+  - mstr_user_migrator.py
+  - mstr_cache_warmer.py
   - full_validation_runner.py
+  # Command Manager scripts (run as IS remote client)
   - mstr_command_manager.scp
+  - extended_command_manager.scp
 outputs:
   - 21 CSVs per harvest run
   - SUMMARY_REPORT.txt
@@ -32,6 +39,10 @@ outputs:
   - VALIDATION_REPORT.txt
   - CONNECTIVITY_REPORT.txt
   - MASTER_VALIDATION_REPORT.txt
+  - db_connection_results.csv
+  - DB_CONNECTION_REPORT.txt
+  - created_connection_ids.json
+  - cache_warm_results.csv
 ---
 
 # MicroStrategy Cloud Migration — Project Skill Context
@@ -51,6 +62,44 @@ MicroStrategy Cloud (CMC cluster) across three phases:
 | 3 — Validation | Verify cloud matches on-prem baseline | DIFF_REPORT.csv + VALIDATION_REPORT.txt |
 
 **Philosophy:** One admin, zero consultants, fully automated, AI-accelerated.
+
+---
+
+## EXECUTION ARCHITECTURE — WHERE TO RUN EACH SCRIPT
+
+A critical insight for CMC cluster migrations: **you may not have shell access to the cloud IS host**.
+All scripts in this toolkit use one of two MSTR native execution layers that work remotely.
+
+### Group A — REST API Scripts (Run from your laptop)
+These scripts communicate over HTTPS to the IS REST API endpoint. No installation needed on the IS.
+The IS itself performs the operations — your laptop just sends HTTP requests.
+
+| Script | Layer | Runs On | Network Requirement |
+|--------|-------|---------|-------------------|
+| `mstr_harvester.py` | REST API v2 | Any machine | HTTPS to IS on port 443 |
+| `mstr_validator.py` | Local file diff | Any machine | None (offline) |
+| `mstr_connectivity_tester.py` | Local + REST API | Any machine | HTTPS to IS + ICMP/TCP to DBs |
+| `mstr_db_connection_creator.py` | REST API v2 | Any machine | HTTPS to IS; IS connects to DBs |
+| `mstr_package_migrator.py` | REST API v2 | Any machine | HTTPS to both source and cloud IS |
+| `mstr_user_migrator.py` | REST API v2 | Any machine | HTTPS to cloud IS |
+| `mstr_cache_warmer.py` | REST API v2 | Any machine | HTTPS to cloud IS |
+| `full_validation_runner.py` | REST API v2 | Any machine | HTTPS to cloud IS |
+
+### Group B — Command Manager Scripts (Run as IS remote client)
+Command Manager connects to the IS over the IS port (default 34952). It works as a remote client
+and does NOT need to run on the IS host — install MSTR client tools on your workstation.
+
+| Script | Layer | Runs On | Network Requirement |
+|--------|-------|---------|-------------------|
+| `mstr_command_manager.scp` | Command Manager | Any MSTR client machine | TCP to IS on port 34952 |
+| `extended_command_manager.scp` | Command Manager | Any MSTR client machine | TCP to IS on port 34952 |
+
+### Key Insight: IS-Side Connectivity Testing
+`mstr_db_connection_creator.py` uses `POST /api/datasources/{id}/testConnection`.
+This fires the DB connection test **FROM the IS itself** — not from your laptop.
+This is the correct vantage point for verifying cloud IS → cloud DW connectivity.
+A result of `REACHABLE_AUTH_NEEDED` (HTTP 400 + credential error) means TCP connectivity
+succeeded — the IS can reach the DB. This counts as a **connectivity PASS**.
 
 ---
 
@@ -196,6 +245,201 @@ python full_validation_runner.py \
   --odbc-file /etc/odbc.ini \
   --output-dir ./full_validation
 ```
+
+---
+
+### `mstr_db_connection_creator.py`
+**Purpose:** Phase 2 — Recreate DB datasources on cloud IS and test connectivity FROM the IS  
+**How it works:** Reads `odbc.ini`, builds a datasource payload per DSN, creates each via
+`POST /api/datasources`, then tests connectivity using `POST /api/datasources/{id}/testConnection`.
+The test fires from the IS — correct vantage point for cloud DW reachability.
+
+**Usage:**
+```bash
+# Create all datasources from odbc.ini and test each from the IS
+python mstr_db_connection_creator.py \
+    --host     https://CLOUD-MSTR/MicroStrategyLibrary \
+    --username Administrator \
+    --password CloudPass \
+    --odbc-file /etc/odbc.ini \
+    --mode     create-and-test
+
+# Test-only (already created datasources)
+python mstr_db_connection_creator.py \
+    --host https://CLOUD-MSTR/MicroStrategyLibrary \
+    --username Administrator --password CloudPass \
+    --mode test-existing
+
+# Dry run — preview what would be created
+python mstr_db_connection_creator.py ... --mode dry-run
+```
+
+**Key flags:**
+- `--mode create-and-test` (default) | `test-existing` | `create-only` | `dry-run`
+- `--project-id ID` — associate datasources with a specific project
+- `--no-ssl-verify` — skip SSL cert check
+
+**Output files:**
+```
+db_connection_results.csv       DSN | host | port | db_type | create_status | test_status | error
+DB_CONNECTION_REPORT.txt        Human-readable pass/fail per connection
+created_connection_ids.json     MSTR datasource IDs created (for teardown or re-use)
+```
+
+**Status values:**
+- `REACHABLE` — test returned HTTP 200; DB is fully reachable and accepting connections
+- `REACHABLE_AUTH_NEEDED` — HTTP 400 + credential error; TCP connectivity PASS (IS can reach DB)
+- `UNREACHABLE` — network-level failure (wrong host/port, firewall block)
+- `SKIPPED` — dry-run mode
+
+---
+
+### `mstr_package_migrator.py`
+**Purpose:** Phase 2 — Export project packages from source IS, import to cloud IS via REST API  
+**How it works:** Uses MSTR REST API `/api/packages` (MSTR 2021 Update 5+) to export a project
+package (.mmp binary), download it, upload to cloud IS, and trigger an import migration job.
+
+**Usage:**
+```bash
+# Full cycle: export from on-prem, import to cloud
+python mstr_package_migrator.py \
+    --source-host  https://ONPREM-MSTR/MicroStrategyLibrary \
+    --source-user  Administrator --source-pass OnPremPass \
+    --target-host  https://CLOUD-MSTR/MicroStrategyLibrary \
+    --target-user  Administrator --target-pass CloudPass \
+    --project-id   YOUR-PROJECT-GUID \
+    --output-dir   ./migration_packages
+
+# Export only (stage package, import later)
+python mstr_package_migrator.py ... --mode export-only
+
+# Import only (from pre-existing .mmp file)
+python mstr_package_migrator.py \
+    --target-host ... --target-user ... --target-pass ... \
+    --package-file ./migration_packages/project.mmp \
+    --mode import-only
+```
+
+**Key flags:**
+- `--mode full` (default) | `export-only` | `import-only`
+- `--package-file PATH` — pre-existing .mmp file for import-only mode
+- `--conflict-action replace` — object conflict resolution (replace/use_existing/keep_both)
+
+**Requirements:** MSTR 2021 Update 5+ on both source and cloud IS.
+
+---
+
+### `mstr_user_migrator.py`
+**Purpose:** Phase 2 — Bulk-create users, groups, and memberships on cloud IS from harvest CSVs  
+**How it works:** Reads `03_users.csv`, `04_usergroups.csv`, `05_group_membership.csv` from the
+harvest output and recreates the full user hierarchy via REST API.
+
+**Usage:**
+```bash
+# Full migration: groups → users → memberships
+python mstr_user_migrator.py \
+    --host       https://CLOUD-MSTR/MicroStrategyLibrary \
+    --username   Administrator \
+    --password   CloudPass \
+    --harvest-dir ./discovery_output \
+    --temp-password "Temp@MigrPwd2026!" \
+    --mode       full
+
+# Groups only
+python mstr_user_migrator.py ... --mode groups
+
+# Dry run — shows what would be created
+python mstr_user_migrator.py ... --mode dry-run
+```
+
+**Key flags:**
+- `--mode full` (default) | `groups` | `users` | `memberships` | `dry-run`
+- `--temp-password PASS` — temporary password for Standard-auth users (required new password on first login)
+- `--skip-existing` — skip users/groups that already exist on cloud IS
+
+**Behaviour:**
+- Skips built-in accounts (`administrator`, `guest`)
+- LDAP/SAML users get shell accounts (no MSTR password; auth handled by IdP)
+- Standard users get `--temp-password` with `requireNewPassword=true`
+- Outputs: `user_migration_results.csv` with status per user/group
+
+---
+
+### `mstr_cache_warmer.py`
+**Purpose:** Phase 2 / Pre-Go-Live — Pre-execute top reports to warm IS cache before users log in  
+**How it works:** Reads `09_reports.csv` from harvest, groups by project, picks top-N most-used
+reports, executes each via `POST /api/reports/{id}/instances` on the cloud IS. The IS caches the
+result. Dossiers are warmed via `POST /api/dossiers/{id}/instances`.
+
+**Usage:**
+```bash
+# Warm top 50 reports across all projects
+python mstr_cache_warmer.py \
+    --host        https://CLOUD-MSTR/MicroStrategyLibrary \
+    --username    Administrator \
+    --password    CloudPass \
+    --reports-csv ./discovery_output/09_reports.csv \
+    --top-n       50 \
+    --output-dir  ./cache_warm_results
+
+# Warm specific project only
+python mstr_cache_warmer.py ... --project-id YOUR-PROJECT-GUID --top-n 20
+
+# Dry run — see which reports would be warmed
+python mstr_cache_warmer.py ... --mode dry-run
+```
+
+**Key flags:**
+- `--top-n N` — top N reports to warm per project (default: 50)
+- `--timeout SECS` — max seconds to wait per report execution (default: 120)
+- `--delay SECS` — pause between executions to avoid IS overload (default: 1.0)
+- `--mode warm` (default) | `dry-run`
+
+**Status values:**
+- `EXECUTED` — report ran and is now cached
+- `SKIP_PROMPTS` — report has required prompts; cannot execute unattended
+- `SKIP_ACCESS` — admin account lacks execute access to this report
+- `NOT_FOUND` — report not migrated yet
+- `TIMEOUT` — IS did not respond within timeout
+
+**Output files:**
+```
+cache_warm_results.csv    report_id | name | project | warm_status | elapsed_ms | rows | error
+```
+
+---
+
+### `extended_command_manager.scp`
+**Purpose:** Phase 2 — Advanced bulk operations via Command Manager (IS remote client)  
+**How it works:** 13-section Command Manager script for bulk operations not easily achievable
+via REST API: VLDB property changes, schedule creation, bulk user creation, security filter
+assignment, cache management, and project lifecycle control.
+
+**Execution:**
+```cmd
+# Windows
+%MSTR_HOME%\bin\mstrcmd.exe -f extended_command_manager.scp ^
+    -n IS_HOSTNAME -u Administrator -p YourPassword -o cm_output.txt
+
+# Linux
+$MSTR_HOME/bin/mstrcmd -f extended_command_manager.scp \
+    -n IS_HOSTNAME -u Administrator -p YourPassword -o cm_output.txt
+```
+
+**Key sections:**
+- Section 1: Bulk VLDB property changes (project-level) — row limits, join types, SQL settings
+- Section 2: Bulk VLDB overrides (object-level) — per-report exception handling
+- Section 3: Bulk schedule creation — daily, weekly, monthly, event-based, intraday
+- Section 4: Bulk user creation — Standard + LDAP + SAML + group membership assignment
+- Section 5: Bulk security filter assignment — assign filters to users and groups
+- Section 6: Subscription management — trigger, enable/disable, delete subscriptions
+- Section 7: Cache management — purge all types, list cache statistics
+- Section 8: Project lifecycle — LOAD/UNLOAD, set governor limits
+- Section 9: Bulk object admin — change owners, move objects, alter cache settings
+- Section 10: DB connection management — update hosts/credentials post-migration
+- Section 11: LDAP/SAML config audit
+- Section 12: Full post-migration validation checklist (all LIST commands)
+- Section 13: Logout
 
 ---
 
@@ -374,23 +618,31 @@ PWD      = password
 ```
 DISCOVERY (Phase 1)
   └─ python mstr_harvester.py --host ON-PREM-URL --all-projects
+       → 21 CSVs + SUMMARY_REPORT.txt
   └─ python mstr_connectivity_tester.py --odbc-file odbc.ini --cmc-host CLOUD-HOST
-  └─ Feed SUMMARY_REPORT.txt + connectivity results to AI
-  └─ AI produces: risk matrix, migration order, effort estimate
+       → connectivity_results.csv (from laptop vantage)
+  └─ Feed SUMMARY_REPORT.txt + CSVs to AI
+       → risk matrix, migration order, effort estimate
 
 MIGRATION (Phase 2)
-  └─ Command Manager: EXPORT project packages
-  └─ CMC Workbench: metadata DB migration
-  └─ REST API scripts (AI-generated): recreate users, groups, DB connections
-  └─ Command Manager: IMPORT project packages to cloud IS
+  └─ mstr_package_migrator.py --source-host ON-PREM --target-host CLOUD
+       → Export project .mmp packages, import to cloud IS via REST API
+  └─ mstr_user_migrator.py --host CLOUD --harvest-dir ./discovery_output --mode full
+       → Recreate all users, groups, memberships from harvest CSVs
+  └─ mstr_db_connection_creator.py --host CLOUD --odbc-file odbc.ini --mode create-and-test
+       → Recreate datasources on cloud IS; test each FROM the IS (correct vantage)
+  └─ extended_command_manager.scp  (Command Manager)
+       → Bulk VLDB changes, schedule creation, security filter assignment
+  └─ mstr_cache_warmer.py --host CLOUD --reports-csv ./discovery_output/09_reports.csv
+       → Pre-warm top 50 reports before users log in
 
 VALIDATION (Phase 3)
-  └─ python mstr_harvester.py --host CLOUD-URL --all-projects (saves to ./cloud_discovery)
-  └─ python mstr_connectivity_tester.py --odbc-file odbc.ini --cmc-host CLOUD-HOST
-  └─ python mstr_validator.py --baseline ./discovery_output --target ./cloud_discovery
-  └─ python full_validation_runner.py (orchestrates all of the above)
-  └─ Feed DIFF_REPORT.csv to AI → classified issues + remediation
-  └─ AI generates VALIDATION_REPORT (sign-off document for end user)
+  └─ python full_validation_runner.py (orchestrates all validation steps)
+       OR run individually:
+       python mstr_harvester.py --host CLOUD-URL --all-projects --output-dir ./cloud_discovery
+       python mstr_validator.py --baseline ./discovery_output --target ./cloud_discovery
+  └─ Feed DIFF_REPORT.csv to AI → classified issues + remediation steps
+  └─ AI generates sign-off report → deliver to end user
 ```
 
 ---
