@@ -689,10 +689,225 @@ VALIDATION (Phase 3)
 
 ---
 
+## CMC KNOWN ISSUES & FIXES
+
+Real issues encountered during CMC migration. Reference these before raising a support ticket.
+
+---
+
+### ISSUE 1 — Free-Form SQL Auto-Converts String Column to Date
+
+**Symptom:** A column defined as VARCHAR/string in the warehouse is rendered as a date type
+inside a MicroStrategy free-form SQL report on CMC.
+
+**Root Cause:** The IS reads column type metadata from the JDBC/ODBC driver response. If the
+driver reports the column as `DATE` or `TIMESTAMP` (even implicitly), MSTR honours it.
+
+**Fixes (in order of preference):**
+
+Fix A — CAST the column in the SQL to force VARCHAR metadata:
+```sql
+-- MySQL / SingleStore compatible:
+SELECT CONVERT(order_date, CHAR) AS order_date FROM orders
+
+-- ANSI SQL (most other DBs):
+SELECT CAST(order_date AS VARCHAR(30)) AS order_date FROM orders
+```
+
+Fix B — Override column type in the report editor:
+In the Free-Form SQL report → column definition pane → change **Data Type** from
+`Date`/`Timestamp` → `VarChar`. Save and re-execute.
+
+Fix C — VLDB property to preserve driver-reported type:
+```
+Project Configuration → VLDB Properties
+→ "Preserve column data type from query" → Disabled
+```
+
+Fix D — Add type-hint parameter to JDBC connection URL (MySQL/SingleStore):
+```
+noDatetimeStringSync=true&zeroDateTimeBehavior=convertToNull
+```
+Add to the JDBC URL in DB connection settings on the CMC IS.
+
+---
+
+### ISSUE 2 — SingleStore JDBC Error Despite Telnet/Ping Passing
+
+**Symptom:** Telnet and ping to SingleStore host:port succeed. MSTR datasource `testConnection`
+returns a JDBC error. The connection cannot be created in CMC.
+
+**Root Cause:** Telnet confirms TCP connectivity only. JDBC errors happen at the application
+protocol layer — wrong driver JAR, wrong URL prefix, SSL mismatch, or wrong driver class name.
+
+**Checklist:**
+
+1. **Driver JAR location** — must be on the IS host at:
+   ```
+   /opt/MicroStrategy/install/JDBC/drivers/   (Linux)
+   %MSTR_HOME%\JDBC\drivers\                  (Windows)
+   ```
+   Download from `https://github.com/memsql/singlestore-jdbc-client/releases`.
+   Restart IS after copying.
+
+2. **JDBC URL prefix** — SingleStore v1.1.4+ requires:
+   ```
+   jdbc:singlestore://HOST:3306/DATABASE
+   ```
+   Legacy/MemSQL driver uses `jdbc:mysql://`. Mixing them causes failure.
+
+3. **Driver class name:**
+   | Driver | Class |
+   |--------|-------|
+   | SingleStore v1.1.4+ | `com.singlestore.jdbc.Driver` |
+   | MemSQL / Legacy | `com.mysql.jdbc.Driver` |
+
+4. **SSL enforcement** — SingleStore Cloud requires SSL:
+   ```
+   jdbc:singlestore://HOST:3306/DB?sslMode=REQUIRED&serverSslCert=/path/to/cert.pem
+   ```
+   For internal/testing: `?sslMode=DISABLED`
+
+5. **Authentication plugin** — add to JDBC URL if auth fails:
+   ```
+   ?authenticationPlugins=mysql_native_password
+   ```
+
+**Full working JDBC URL for SingleStore on CMC:**
+```
+jdbc:singlestore://your-host.svc:3306/your_db
+  ?sslMode=REQUIRED
+  &defaultFetchSize=10000
+  &allowMultiQueries=true
+  &characterEncoding=UTF-8
+  &authenticationPlugins=mysql_native_password
+```
+
+After changing the URL or JAR, test via IS-side REST API (fires FROM the IS — correct vantage):
+```
+POST /api/datasources/{id}/testConnection
+```
+
+---
+
+### ISSUE 3 — CMC on GKE Not Using Secrets Manager; Gatekeeper Blocks Global Variables
+
+**Symptom:** CMC stores DB credentials as environment variables (global variables in pod spec).
+Organisation has OPA Gatekeeper policies that prohibit this. GKE Secrets are not wired up.
+
+**Root Cause:** Default CMC deployment stores connection passwords in environment variables or
+ConfigMaps — both are blocked by Gatekeeper and neither is encrypted at rest properly.
+
+**Solution A — External Secrets Operator + Google Secret Manager** *(recommended)*
+
+Secrets live in Google Secret Manager. ESO syncs them to K8s Secrets. MSTR pod mounts the
+K8s Secret. No plaintext credentials anywhere in the cluster manifest.
+
+```bash
+# 1. Store password in GSM:
+echo -n "your-db-password" | gcloud secrets create mstr-db-password \
+    --data-file=- --project=YOUR_PROJECT
+
+# 2. Install ESO:
+helm repo add external-secrets https://charts.external-secrets.io
+helm install external-secrets external-secrets/external-secrets \
+    -n external-secrets --create-namespace
+```
+
+```yaml
+# 3. SecretStore — points ESO at GSM via Workload Identity:
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: gcp-secret-store
+  namespace: microstrategy
+spec:
+  provider:
+    gcpsm:
+      projectID: YOUR_GCP_PROJECT_ID
+      auth:
+        workloadIdentity:
+          clusterLocation: us-central1
+          clusterName: YOUR_CLUSTER
+          serviceAccountRef:
+            name: mstr-workload-sa
+
+# 4. ExternalSecret — materialises GSM secret as K8s Secret:
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: mstr-db-credentials
+  namespace: microstrategy
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: gcp-secret-store
+    kind: SecretStore
+  target:
+    name: mstr-db-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: db_password
+      remoteRef:
+        key: mstr-db-password
+```
+
+```yaml
+# 5. Mount in MSTR pod (no global variable, no ConfigMap):
+env:
+  - name: MSTR_DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: mstr-db-secret
+        key: db_password
+```
+
+**Solution B — Workload Identity + Secret Manager SDK (no K8s Secrets at all)**
+
+If Gatekeeper also blocks K8s Secrets, fetch directly from GSM at pod startup:
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  mstr-sa@YOUR_PROJECT.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:YOUR_PROJECT.svc.id.goog[microstrategy/mstr-ksa]"
+
+gcloud secrets add-iam-policy-binding mstr-db-password \
+  --member="serviceAccount:mstr-sa@YOUR_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+```python
+# Fetch at MSTR startup script / init container:
+from google.cloud import secretmanager
+client = secretmanager.SecretManagerServiceClient()
+secret = client.access_secret_version(
+    name="projects/YOUR_PROJECT/secrets/mstr-db-password/versions/latest"
+)
+password = secret.payload.data.decode("UTF-8")
+```
+
+**Solution C — HashiCorp Vault sidecar** (if org already runs Vault):
+```yaml
+annotations:
+  vault.hashicorp.com/agent-inject: "true"
+  vault.hashicorp.com/agent-inject-secret-db-password: "secret/mstr/db"
+  vault.hashicorp.com/role: "mstr-role"
+```
+Vault Agent writes the secret to `/vault/secrets/` as a tmpfs file — never in etcd.
+
+**Decision guide:**
+| Situation | Solution |
+|-----------|----------|
+| Gatekeeper allows K8s Secrets in MSTR namespace | Solution A (ESO + GSM) |
+| Gatekeeper blocks ALL K8s Secrets | Solution B (Workload Identity direct) |
+| Org already runs HashiCorp Vault | Solution C (Vault sidecar) |
+
+---
+
 ## AUTHOR / PROJECT INFO
 
 - **Admin:** Pranay (pranay136@gmail.com)
-- **Toolkit Version:** 2.0
+- **Toolkit Version:** 2.1
 - **Date:** April 2026
 - **Migration Type:** MicroStrategy on-prem → MicroStrategy Cloud (CMC cluster)
 - **Tested Against:** MicroStrategy 2021 Update 7+, 2022, 2023
