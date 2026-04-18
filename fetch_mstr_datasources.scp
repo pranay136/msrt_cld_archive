@@ -1,0 +1,83 @@
+/*
+================================================================================
+  fetch_mstr_datasources.scp
+  MicroStrategy Command Manager Script — Windows / Citrix
+  ================================================================================
+  PURPOSE:
+    Lists every datasource and database connection configured in MicroStrategy,
+    across all projects on this Intelligence Server. Output is saved to a text
+    file which the companion script (build_acl_request.ps1) then parses to
+    produce the final ACL request CSV.
+
+  HOW TO RUN (Windows Command Prompt on Citrix server):
+  ─────────────────────────────────────────────────────
+    1. Open Command Prompt (or PowerShell)
+    2. Navigate to the MSTR bin folder (or add it to PATH):
+         cd "C:\Program Files (x86)\MicroStrategy\Intelligence Server"
+
+    3. Run the script:
+         mstrcmd.exe -f "C:\ACL_Work\fetch_mstr_datasources.scp" ^
+                     -n YOUR-IS-HOSTNAME ^
+                     -u Administrator ^
+                     -p YourPassword ^
+                     -o "C:\ACL_Work\mstr_datasource_dump.txt"
+
+  PARAMETERS:
+    -f   Full path to this .scp file
+    -n   Intelligence Server hostname (e.g. mstr-is.company.com or IP)
+    -u   MSTR admin username
+    -p   MSTR admin password
+    -o   Output text file path (feed this to build_acl_request.ps1)
+
+  OUTPUT:
+    mstr_datasource_dump.txt — all datasource info from MSTR metadata.
+    Feed this file into build_acl_request.ps1 to get the final ACL CSV.
+
+  NOTE:
+    If you get "Cannot connect to Intelligence Server" — ensure TCP port 34952
+    is open between the Citrix server and the IS host.
+================================================================================
+*/
+
+/* ── STEP 1: Connect to Intelligence Server ─────────────────────────────── */
+
+LOGIN SERVER "YOUR-IS-HOSTNAME"
+      LOGIN "Administrator"
+      PASSWORD "YourPassword";
+
+/* ── STEP 2: List all Projects (to know which to iterate) ───────────────── */
+
+LIST ALL PROJECTS;
+
+/* ── STEP 3: List ALL Datasources at server level ──────────────────────── */
+/* These are the ODBC/database connection definitions MSTR knows about      */
+
+LIST ALL DATASOURCES;
+
+/* ── STEP 4: Per-project — list datasources and DB connections ──────────── */
+/* Repeat this block for each project in your environment.                   */
+/* Replace "PROJECT_NAME_HERE" with your actual project names.               */
+/* Add or remove blocks as needed.                                           */
+
+/* ---- Project 1 ---------------------------------------------------------- */
+LIST ALL DATASOURCES IN PROJECT "PROJECT_NAME_HERE";
+LIST ALL DBCONNECTIONS IN PROJECT "PROJECT_NAME_HERE";
+LIST ALL DATASOURCES WITH DETAIL IN PROJECT "PROJECT_NAME_HERE";
+
+/* ---- Project 2 (copy-paste and rename) ---------------------------------- */
+/* LIST ALL DATASOURCES IN PROJECT "PROJECT_NAME_2";                        */
+/* LIST ALL DBCONNECTIONS IN PROJECT "PROJECT_NAME_2";                      */
+/* LIST ALL DATASOURCES WITH DETAIL IN PROJECT "PROJECT_NAME_2";            */
+
+/* ── STEP 5: List all DB Connections at server level ─────────────────────  */
+
+LIST ALL DBCONNECTIONS;
+
+/* ── STEP 6: List all ODBC DSN names the IS knows about ─────────────────── */
+/* This shows which DSNs are registered on the IS side                       */
+
+LIST ALL DBMS;
+
+/* ── STEP 7: Logout ─────────────────────────────────────────────────────── */
+
+LOGOUT SERVER "YOUR-IS-HOSTNAME";
