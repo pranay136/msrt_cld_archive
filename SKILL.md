@@ -6,9 +6,9 @@ description: >
   + REST API scripts), and Validation (diff engine + connectivity tester + sign-off report).
   Use this skill as context whenever working on MSTR migration tasks, script generation,
   AI prompt execution, connectivity testing, or validation reporting.
-version: "2.0"
+version: "2.2"
 author: Pranay (pranay136@gmail.com)
-date: 2026-04-11
+date: 2026-04-18
 tags:
   - microstrategy
   - cloud-migration
@@ -28,6 +28,7 @@ scripts:
   - mstr_package_migrator.py
   - mstr_user_migrator.py
   - mstr_cache_warmer.py
+  - mstr_report_validator.py
   - full_validation_runner.py
   # Command Manager scripts (run as IS remote client)
   - mstr_command_manager.scp
@@ -224,6 +225,92 @@ python mstr_connectivity_tester.py \
 db_connections_inventory.csv   All parsed DSN entries with category/DB type
 connectivity_results.csv       Ping + port test results per connection
 CONNECTIVITY_REPORT.txt        Human-readable pass/fail summary
+```
+
+---
+
+### `mstr_report_validator.py`
+**Purpose:** Report & Dossier Execution Testing — Migration validation and MSTR upgrade regression testing  
+**Execution layer:** REST API — runs from your laptop, no cluster shell needed.  
+**Owner:** EBI team (zero dependency on Business or HCL for non-prompted reports)
+
+**Why it exists:** Integrity Manager only compares rendered output between two live environments simultaneously.
+It cannot handle prompted reports programmatically, does not run at scale, and cannot store a reusable baseline.
+`mstr_report_validator.py` solves all of these gaps.
+
+**Key capabilities:**
+- `capture` mode: execute all reports/dossiers on source environment, save JSON snapshots to disk
+- `compare` mode: execute target environment live, compare against stored baseline
+- `full` mode: execute both environments simultaneously, compare on-the-fly
+- Detects row count changes, schema changes (added/removed columns), and data value drift (hash mismatch)
+- Prompt answers pre-configured in YAML — no business user involvement needed at run time
+- Parallel execution (4–8 workers) — tests 500+ reports in minutes
+- HTML dashboard + CSV output for failures
+
+**Quick start (migration validation):**
+```bash
+# Step 1: Generate config template
+python mstr_report_validator.py --init
+
+# Step 2: Edit config.yaml (source = on-prem, target = cloud)
+
+# Step 3: Capture on-prem baseline BEFORE migration
+python mstr_report_validator.py --mode capture --config config.yaml
+
+# Step 4: After migration, compare cloud vs baseline
+python mstr_report_validator.py --mode compare --config config.yaml --label post-migration
+# → Produces: ./validation_reports/validation_YYYYMMDD_HHMMSS.html + .csv
+```
+
+**Quick start (MSTR upgrade testing):**
+```bash
+# Capture baseline BEFORE upgrade
+python mstr_report_validator.py --mode capture --config config.yaml --label pre-upgrade-v12
+
+# <perform MSTR upgrade>
+
+# Compare AFTER upgrade (source and target point to same server, before/after)
+python mstr_report_validator.py --mode compare --config config.yaml --label post-upgrade-v12
+```
+
+**Use harvest CSVs for faster, more accurate inventory:**
+```bash
+python mstr_report_validator.py --mode full --config config.yaml \
+    --harvest-csv ./discovery_output/09_reports.csv
+```
+
+**Config: prompt_answers (eliminating business-user dependency for prompted reports):**
+```yaml
+prompt_answers:
+  - report_id: "PASTE_REPORT_GUID_HERE"   # from 09_reports.csv
+    prompts:
+      - key: "Year"
+        type: VALUE
+        value: "2024"
+      - key: "Region"
+        type: ELEMENTS
+        value: ["North America"]
+```
+
+**Cross-team dependency map for EBI:**
+
+| Dependency | Owned by | Notes |
+|-----------|----------|-------|
+| IS admin credentials (source + target) | EBI admin | Already in hand |
+| Report/dossier object IDs | EBI (from harvest) | 09_reports.csv from mstr_harvester.py |
+| Datasource credentials on IS | EBI ACL Specialist | Already set on IS — no DB-level creds needed |
+| Prompt answer values (one-time) | Business (one-time input) | Pre-configure in YAML; no run-time dependency |
+| Network access to IS (HTTPS 443) | EBI ACL | Already required for existing REST API scripts |
+
+**Output files:**
+```
+./validation_reports/
+  validation_YYYYMMDD_HHMMSS.html   Interactive dashboard with pass/fail/warn/skip
+  validation_YYYYMMDD_HHMMSS.csv    Machine-readable; import to JIRA/ServiceNow
+./baseline/
+  {REPORT_GUID}.json                One file per report — JSON snapshot with row count,
+                                    column names, data hash, 5 sample rows, exec time
+  _capture_summary.json             Totals: success/error/skipped
 ```
 
 ---

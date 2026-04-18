@@ -176,6 +176,7 @@ With this toolkit, the ~3.5 hours of admin time breaks down as:
 | Recreate DB connections + IS-side connectivity test | 10–15 min | `mstr_db_connection_creator.py` |
 | Bulk VLDB, schedules, security filters | 10–15 min | `extended_command_manager.scp` |
 | Pre-warm top-50 report caches | 15–30 min | `mstr_cache_warmer.py` |
+| Report/dossier execution validation (EBI-owned) | 20–45 min | `mstr_report_validator.py` |
 | Run `full_validation_runner.py` on cloud IS | 30 min | `full_validation_runner.py` |
 | Feed `DIFF_REPORT.csv` to AI, review issues | 15 min | Claude / ChatGPT |
 | Deliver AI-generated sign-off report to end user | 10 min | Claude / ChatGPT |
@@ -280,7 +281,56 @@ python mstr_cache_warmer.py \
 
 ---
 
-### Phase 3 — Validation (All-in-One)
+### Phase 3 — Report & Dossier Execution Validation (EBI-owned)
+
+This step runs actual report executions on the cloud IS and compares outputs against the on-prem baseline.
+It is owned entirely by EBI — no business user involvement needed for non-prompted reports.
+
+**Step 0 — Generate config template:**
+```bash
+python mstr_report_validator.py --init
+# Edit the generated config.yaml: set source/target hosts, credentials, project name
+```
+
+**Step 1 — Capture on-prem baseline (before or during migration):**
+```bash
+python mstr_report_validator.py \
+    --mode capture \
+    --config config.yaml \
+    --harvest-csv ./discovery_output/09_reports.csv
+# Snapshots saved to: ./baseline/{report_id}.json
+```
+
+**Step 2 — Compare cloud vs baseline (after migration):**
+```bash
+python mstr_report_validator.py \
+    --mode compare \
+    --config config.yaml \
+    --label post-migration
+# Output: ./validation_reports/validation_YYYYMMDD.html (interactive dashboard)
+#         ./validation_reports/validation_YYYYMMDD.csv  (for tickets/JIRA)
+```
+
+**Or run both sides simultaneously (full mode):**
+```bash
+python mstr_report_validator.py \
+    --mode full \
+    --config config.yaml \
+    --harvest-csv ./discovery_output/09_reports.csv
+```
+
+**For MSTR upgrade testing (same workflow, reusable tool):**
+```bash
+# Before upgrade — capture baseline
+python mstr_report_validator.py --mode capture --config config.yaml --label pre-upgrade-v12
+
+# After upgrade — compare
+python mstr_report_validator.py --mode compare --config config.yaml --label post-upgrade-v12
+```
+
+---
+
+### Phase 3 — Validation (Metadata All-in-One)
 
 ```bash
 python full_validation_runner.py \
@@ -324,6 +374,7 @@ All scripts use one of two MSTR-native remote execution layers — no shell acce
 | `mstr_user_migrator.py` | 2 | Bulk-create users/groups/memberships from harvest CSVs | `user_migration_results.csv` |
 | `mstr_db_connection_creator.py` | 2 | Create datasources on cloud IS; test FROM the IS | `db_connection_results.csv` |
 | `mstr_cache_warmer.py` | 2/Pre-go-live | Pre-execute top-N reports to warm IS cache | `cache_warm_results.csv` |
+| `mstr_report_validator.py` | 3/Upgrades | Execute reports/dossiers on both envs, compare output (rows, schema, data) | `validation_*.html` + `.csv` |
 | `mstr_validator.py` | 3 | Diff on-prem baseline vs cloud harvest | `DIFF_REPORT.csv` + `VALIDATION_REPORT.txt` |
 | `full_validation_runner.py` | 3 | Orchestrate all Phase 3 steps in one command | `MASTER_VALIDATION_REPORT.txt` |
 
