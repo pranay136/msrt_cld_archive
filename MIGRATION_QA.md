@@ -558,4 +558,175 @@ The RACI Excel (`MSTR_Migration_RACI_v3.xlsx`) covers four teams across four pha
 
 ---
 
-*Document version: 1.0 | Last updated: April 2026 | EBI Team — Pranay (pranay136@gmail.com)*
+---
+
+## Q17
+### Where can this migration go wrong? Stress-test the entire strategy.
+**Answer: 13 identified failure points across 5 categories — all mitigable with specific actions**
+
+---
+
+#### CATEGORY 1 — TIME BOMBS (Pass all checks, detonate at go-live)
+
+**Risk 1 — DB passwords are NOT in migration packages.**
+Packages migrate datasource definitions (server, port, driver) but not the password. The password is encrypted using the IS installation's own key and cannot be transported. Anyone who assumes "packages migrated everything" will discover this at 11pm on cutover night when every report returns auth errors.
+
+*Mitigation:* Build a `datasource_passwords.yaml` (git-ignored, encrypted at rest) with all credential pairs during Phase 1. `mstr_db_connection_creator.py` reads from this file. Run `testConnection` immediately after import. Make this an explicit line item on the go-live checklist.
+
+---
+
+**Risk 2 — Schedule timezone trap.**
+MSTR stores schedule times in the IS server's local timezone. If on-prem IS is `America/Chicago` and CMC IS defaults to `UTC`, every scheduled report runs 5–6 hours off. This is invisible in metadata validation — the schedule definition migrates correctly; only execution time is wrong. Business discovers this Monday morning after go-live.
+
+*Mitigation:* Before go-live, confirm CMC IS timezone matches on-prem IS timezone. On Linux CMC: `timedatectl`. If different, adjust all schedule times in `extended_command_manager.scp` or request CMC Ops to set the container timezone.
+
+---
+
+**Risk 3 — Event-based schedules will silently never fire.**
+Reports triggered by ETL completion, file arrival, or API calls fire against the IS URL. If external systems (ETL pipelines, middleware) still point to the on-prem IS URL after cutover, events fire at the dead IS and nothing happens on CMC. No error, no alert — reports simply never run.
+
+*Mitigation:* From `16_schedules.csv`, filter `SCHEDULE_TYPE = EVENT`. For each event-triggered schedule, identify which external system fires the event. Create an "integration update checklist" — each firing system must be updated to the CMC URL before go-live. This is a cross-team dependency that must be in the RACI.
+
+---
+
+**Risk 4 — Non-email subscriptions break completely.**
+Subscriptions delivering to `\\fileserver\shared\` or `ftp://internal-ftp/mstr/` will fail silently from CMC — the cloud IS has no network path to on-prem file shares without explicit VPN/Direct Connect. Email subscriptions work; file-path subscriptions do not.
+
+*Mitigation:* From `17_subscriptions.csv`, filter `DELIVERY_TYPE != EMAIL`. Every non-email subscription is a risk. Classify each as: convert to email, establish network path, or decommission. Resolve before go-live — not after.
+
+---
+
+**Risk 5 — Report API passes but browser renders blank.**
+`mstr_report_validator.py` confirms the IS executes the report and returns correct data. It does not test browser rendering. A Web SDK customization that loaded on the on-prem Tomcat but wasn't ported to CMC causes a blank render even though the underlying data is correct.
+
+*Mitigation:* After automated validation, run a browser-based smoke test on the top 20 highest-accessed reports. Use `mstr_cache_warmer.py` output to identify them. Manually open and verify in CMC Web before DNS flip.
+
+---
+
+**Risk 6 — The baseline goes stale.**
+If the baseline is captured in Week 1 and go-live is Week 8, reports created or modified in those 7 weeks show as false failures or are absent from the baseline entirely.
+
+*Mitigation:* Re-run `mstr_harvester.py` and `mstr_report_validator.py --mode capture` within 24 hours of cutover. Enforce a **change freeze** on the on-prem IS for 48 hours before go-live. Treat final baseline capture as a go-live activity, not a Phase 1 activity.
+
+---
+
+#### CATEGORY 2 — ASSUMPTION FAILURES
+
+**Risk 7 — IP resolution ran from the wrong machine.**
+`build_acl_request.ps1` resolves hostnames from the Citrix machine's DNS. With split-horizon DNS, the same hostname may resolve to a different IP from the CMC network segment. The ACL is raised for the Citrix-resolved IP; the CMC IS traffic is blocked by the actual IP.
+
+*Mitigation:* After raising ACLs, validate every datasource using `POST /api/datasources/{id}/testConnection`. This fires from the IS itself. `REACHABLE_AUTH_NEEDED` = correct IP, traffic passing. Do not close the ACL request until IS-side validation passes for every connection.
+
+---
+
+**Risk 8 — Object cross-references break when projects migrate in the wrong order.**
+Reports in Project A reference shared metrics or filters in Project B. If Project A migrates first, those cross-references resolve to nothing and reports fail with "object not found."
+
+*Mitigation:* Run `mstr_harvester.py` across all instances and ask AI to analyze `09_reports.csv`, `11_metrics.csv`, and `14_filters.csv` for cross-project dependencies. Migrate in dependency order — shared-object projects always first.
+
+---
+
+**Risk 9 — LDAP/SAML breaks because the CMC IS URL changed.**
+SAML IdP metadata has the Assertion Consumer Service URL hardcoded to the on-prem hostname. LDAP server firewall allows only the on-prem IS IP. After DNS flip, all users get authentication errors simultaneously.
+
+*Mitigation:* Before go-live: (1) update the SAML ACS URL in the IdP to the CMC hostname, (2) add CMC IS egress IP to the LDAP server allow list. Both are in the ACL request but NOT in the ODBC-based `build_acl_request.ps1` output — add them manually to the firewall ticket.
+
+---
+
+#### CATEGORY 3 — SEVEN-INSTANCE SPECIFIC RISKS
+
+**Risk 10 — Object GUID collision if consolidating into a single CMC.**
+If all seven instances migrate into one shared CMC environment, objects with the same GUID overwrite each other silently. Whichever instance migrated last wins; earlier instances lose their objects with no error.
+
+*Mitigation:* Run this across all seven harvest outputs before migrating anything:
+```python
+import pandas as pd, glob
+all_ids = pd.concat([pd.read_csv(f)['id'] for f in glob.glob("*/09_reports.csv")])
+print(all_ids[all_ids.duplicated(keep=False)])
+```
+Any duplicate ID is a collision candidate. Resolve before migration begins.
+
+---
+
+**Risk 11 — Version drift across seven instances.**
+If e1 is MSTR 2021 and e3 is MSTR 2022, features deprecated between those versions and the CMC version will silently break. The report validator catches the symptom (data hash mismatch) but not the cause.
+
+*Mitigation:* Compare `01_server_info.csv` across all seven instances. Build a version-gap risk list by reviewing MSTR release notes for deprecations between each instance version and the CMC version. Treat each version gap as a separate risk work stream.
+
+---
+
+**Risk 12 — Instance plugins contain hardcoded environment-specific URLs.**
+A plugin on e3 calls `http://internal-api-e3.company.com/data`. After migration, that URL is unreachable from CMC. The plugin source code is the only place this is visible — it doesn't appear in any harvest CSV.
+
+*Mitigation:* For each instance, collect plugin JARs and decompile or review source. Search for HTTP calls, file paths, and hostname strings. Flag any environment-specific reference. This is manual — budget 2–4 hours per instance.
+
+---
+
+#### CATEGORY 4 — THE MOST DANGEROUS GAP: NO ROLLBACK PLAN
+
+**Risk 13 — There is currently no documented rollback procedure.**
+If critical reports produce wrong data 6 hours after go-live, the team needs a clear, tested path back to on-prem. If the on-prem IS was decommissioned, that path doesn't exist.
+
+*Mitigation:*
+- Keep on-prem IS running for **minimum 4 weeks** after go-live, read-only mode
+- Do not decommission until at least one full monthly reporting cycle completes on CMC
+- Document the rollback as a 3-step runbook: flip DNS back → confirm on-prem IS responds → notify users
+- Define explicit rollback triggers before go-live: e.g., >5% of Priority-1 reports failing, Finance data access down >30 min, LDAP auth failure for all users
+- Practice the DNS rollback during a dry-run migration weekend before the real cutover
+
+---
+
+#### QUICK-REFERENCE RISK REGISTER
+
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|------|-----------|--------|-----------|
+| 1 | DB passwords not in packages | **HIGH** | Critical | `datasource_passwords.yaml` + testConnection |
+| 2 | Schedule timezone mismatch | **HIGH** | High | Verify IS timezone before go-live |
+| 3 | Event schedules never fire | **MEDIUM** | High | Integration update checklist |
+| 4 | File-path subscriptions break | **HIGH** | Medium | Inventory + reclassify before go-live |
+| 5 | Browser renders blank despite API pass | **MEDIUM** | High | Top-20 browser smoke test |
+| 6 | Stale baseline | **HIGH** | Medium | Re-capture within 24h of cutover |
+| 7 | ACL raised for wrong IP | **MEDIUM** | Critical | IS-side testConnection validation |
+| 8 | Cross-project reference failure | **MEDIUM** | High | Dependency-ordered migration |
+| 9 | LDAP/SAML auth breaks | **HIGH** | Critical | Update IdP + LDAP allow list pre-cutover |
+| 10 | GUID collision (if consolidating) | **HIGH** | Critical | Dedup audit before any package migration |
+| 11 | Version drift across 7 instances | **HIGH** | High | Version-gap risk list per instance |
+| 12 | Plugin hardcoded URLs | **MEDIUM** | High | Plugin source code review |
+| 13 | No rollback plan | **CONFIRMED** | Critical | Keep on-prem live 4 weeks post go-live |
+
+---
+
+## Q18
+### Instance tech teams are asking for funding to do validation. What is the strategy?
+
+**Answer: Reframe before you negotiate. The automated toolkit eliminates the work they think they're being paid for.**
+
+---
+
+**Why they're really asking:**
+This is not a technical problem. It is an organisational signal. The funding ask means they feel the migration is being done *to* them rather than *with* them. They expect weeks of manual testing effort and want to be compensated for it. Show them the tool output first — the ask typically deflates immediately.
+
+---
+
+**The five-move strategy:**
+
+**Move 1 — Show before you talk.**
+Before any funding conversation, run `mstr_report_validator.py` against their instance and present the HTML dashboard. "Here are your 847 reports. 831 pass. 16 need attention. Here is exactly what each failure is. We found this in 45 minutes with zero manual effort from your team." Once they see the automation, the premise of the funding ask is gone.
+
+**Move 2 — Reframe the value exchange.**
+Each instance team benefits from migration — they lose their on-prem maintenance burden (server patching, MSTR upgrades, hardware refresh cycles). The migration saves them budget. The conversation becomes: "We are delivering a validated cloud environment at zero cost to your team. We need three things: Citrix access to your IS, one hour with your MSTR admin for prompt value confirmation, and a sign-off review of the validation report. What funding is required for those three activities?"
+
+**Move 3 — Use the RACI as a governance document.**
+The RACI shows each instance team as "Informed" on most migration tasks. If they escalate to wanting "Responsible" or "Accountable" ownership, they gain authority but also gain accountability for delivery timelines. Most teams will choose to stay "Informed" once they understand what accountability means.
+
+**Move 4 — Propose a centralised validation model.**
+EBI runs the full automated validation for all seven instances centrally. Each instance team receives a validation report specific to their instance. Their validation effort is: open the report, read the executive summary, sign the approval email. That is 30 minutes. No team can claim external funding for 30 minutes of reading.
+
+**Move 5 — Document access refusal as a project risk.**
+If a team refuses to provide access without funding, document it: "Instance e3 tech team has not provided IS credentials. EBI cannot perform automated validation for this instance. Risk: go-live for e3 cannot be certified." This is not a threat — it is accurate project risk documentation. Leadership will apply pressure when they see a go-live date slipping because one team withheld access credentials.
+
+**The underlying rule:** Never let another team's budget politics become your technical problem. The only non-negotiable is access. Everything else is negotiable.
+
+---
+
+*Document version: 1.1 | Last updated: April 2026 | EBI Team — Pranay (pranay136@gmail.com)*
